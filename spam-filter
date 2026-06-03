@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 # Spam filter based on scikit.
-# Copyright (c) 2026 <279398@student.pwr.edu.pl>
+# Copyright (c) 2026 Politechnika Wrocławska
 
 from typing import Optional
 import bs4
