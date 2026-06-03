@@ -2,7 +2,7 @@
 # Spam filter based on scikit.
 # Copyright (c) 2026 Politechnika Wrocławska
 
-from typing import Optional
+from typing import Optional, Any
 import bs4
 import email
 import email.policy
@@ -11,6 +11,11 @@ import json
 import os
 import subprocess
 import time
+import pickle
+
+
+def task(task: str, *msg):
+    print(f"\033[2m{task:>10}\033[m", *msg)
 
 
 def setup_dirs():
@@ -20,26 +25,54 @@ def setup_dirs():
             os.makedirs(dir_path)
 
 
+def get_cache_state(k: str) -> Optional[Any]:
+    """Returns state of K from cache/state.json, or None if missing. """
+    if not os.path.exists("cache/state.json"):
+        return None
+    with open("cache/state.json") as f:
+        state = json.load(f)
+    return state.get(k, None)
+
+
+def set_cache_state(k: str, v: Any):
+    """Sets cache state of K to V."""
+    state = {}
+    if os.path.exists("cache/state.json"):
+        with open("cache/state.json") as f:
+            state = json.load(f)
+    state[k] = v
+    with open("cache/state.json", "w") as f:
+        json.dump(state, f, indent=4)
+
+
+def save_cache(name: str, data: Any):
+    with open(f"cache/{name}.pickle", 'wb') as f:
+        pickle.dump(data, f)
+
+
+def load_cache(name: str) -> Any:
+    if not os.path.exists(f"cache/{name}.pickle"):
+        return None
+    with open(f"cache/{name}.pickle", "rb") as f:
+        return pickle.load(f)
+
+
 def download_training_data():
     """Downloads training data using git clone, then copies the raw email format
-    into the dataset/ directory. """
+    into the dataset / directory. """
 
     # Use git clone so it doesn't download it every time, but updates automatically.
-    print(' TASK Downloading stdlib-js/datasets-spam-assassin')
+    task("DOWNLOAD", "stdlib-js/datasets-spam-assassin")
     subprocess.run(['git', 'clone', '--depth=1', 'https://github.com/stdlib-js/datasets-spam-assassin',
                    'download/datasets-spam-assassin'], capture_output=True, text=True)
     head_commit_proc = subprocess.run(['git', '-C', 'download/datasets-spam-assassin',
                                        'rev-parse', 'HEAD'], capture_output=True, text=True)
     head_commit = head_commit_proc.stdout.strip()
 
-    # Caching solution: if we have the same commit between the repository
-    # and in download-status.json, we don't have to process it again.
-    if os.path.exists("cache/download-status.json"):
-        with open("cache/download-status.json") as f:
-            status = json.load(f)
-        if "collected_from_commit" in status and status["collected_from_commit"] == head_commit:
-            print(" TASK Training data already collected")
-            return
+    # Caching solution: if we have processed data from the same commit, don't do it again.
+    if get_cache_state("dataset-collected-from") == head_commit:
+        task("CACHE", "Collected dataset")
+        return
 
     p = 'download/datasets-spam-assassin/data'
     use_dirs = {
@@ -50,7 +83,7 @@ def download_training_data():
         "spam-2": True
     }
 
-    print(" TASK Collecting sources...")
+    task("TASK", "Collecting sources")
 
     for dir_name, is_spam in use_dirs.items():
         for filename in os.listdir(f"{p}/{dir_name}"):
@@ -58,9 +91,6 @@ def download_training_data():
 
             if not filename.endswith('.json'):
                 continue
-
-            print(
-                f"\033[2K\r TASK Collecting file {p}/{dir_name}/{filename}", end="")
 
             with open(f"{p}/{dir_name}/{filename}") as f:
                 json_blob = json.load(f)
@@ -76,9 +106,7 @@ def download_training_data():
             with open(f"{dest}/{hash}", "w") as f:
                 f.write(text)
 
-    print("\n TASK Collected all sources")
-    with open("cache/download-status.json", "w") as f:
-        json.dump({"collected_from_commit": head_commit}, f, indent=4)
+    set_cache_state("dataset-collected-from", head_commit)
 
 
 class SpamFilter:
@@ -89,10 +117,19 @@ class SpamFilter:
 
     def __init__(self, dataset_path: str):
         self.emails = {}
-        self.load_emails(dataset_path)
+        dataset_commit = get_cache_state("dataset-collected-from")
+        cached_emails = load_cache(f"parsed-{dataset_commit}")
+        if cached_emails:
+            task("CACHE", "Parsed emails")
+            self.emails = cached_emails
+        else:
+            self.load_emails(dataset_path)
+            save_cache(f"parsed-{dataset_commit}", self.emails)
+
+        task("TASK", f"\033[1mLoaded {len(self.emails)} emails\033[m")
 
     def load_emails(self, dataset_path):
-        print(" TASK Processing all emails...")
+        task("TASK", "Processing all emails...")
         skipped = 0
 
         for subdir in ["spam", "notspam"]:
@@ -105,21 +142,20 @@ class SpamFilter:
 
                 if text:
                     if processing_took > 0.015:
-                        print(
-                            f" WARN \033[33m{p}\033[m took very long to process:",
-                            f"{int(processing_took * 1000)} ms")
+                        task(
+                            "WARN", f"\033[33m{p}\033[m took very long to process:", f"{int(processing_took * 1000)} ms")
                     self.emails[mail_hash] = [
                         True if subdir == "spam" else False,
                         text
                     ]
 
                 if not text:
-                    print(f"ERROR \033[31m{p}\033[m failed")
+                    task("ERROR", f"\033[31m{p}\033[m failed")
                     skipped += 1
 
-        print(
-            f" TASK \033[1mDataset has {len(self.emails)} records\033[m,",
-            f"skipped {skipped} due to processing errors")
+        task("TASK",
+             f"\033[1mDataset has {len(self.emails)} records\033[m,",
+             f"skipped {skipped} due to processing errors")
 
     def _get_content(self, mime_part):
         """Some emails have weird character sets like "DEFAULT", so we just turn
@@ -146,7 +182,7 @@ class SpamFilter:
             body = bs4.BeautifulSoup(html_text, 'html.parser').get_text()
             return body
         except Exception:
-            print("ERROR Failed to parse HTML")
+            task("ERROR", "Failed to parse HTML")
             return None
 
     def _find_body(self, m: email.message.EmailMessage) -> Optional[str]:
@@ -178,11 +214,10 @@ class SpamFilter:
                     body = self._text_from_html(self._get_content(part))
                     break
             if not body:
-                print("ERROR Cannot find working text format in email")
+                task("ERROR", "Cannot find working text format in email")
                 return None
         else:
-            print(
-                "ERROR Unsupported Content-Type while processing emails:", content_type)
+            task("ERROR", "Unsupported Content-Type while processing emails:", content_type)
             return None
         return body
 
