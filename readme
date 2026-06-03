@@ -1,0 +1,6 @@
+spam-filter
+===========
+
+Email spam filter created for a university course, based on the following data:
+https://github.com/stdlib-js/datasets-spam-assassin, licensed under "Open Data
+Commons Public Domain Dedication & License 1.0.". Thank you stdlib-js.
