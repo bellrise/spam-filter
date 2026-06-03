@@ -2,7 +2,16 @@
 # Spam filter based on scikit.
 # Copyright (c) 2026 Politechnika Wrocławska
 
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.model_selection import RepeatedStratifiedKFold
+from sklearn.naive_bayes import GaussianNB
+from sklearn.metrics import f1_score
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.exceptions import ConvergenceWarning
 from typing import Optional, Any
+import concurrent.futures
+import numpy as np
 import bs4
 import email
 import email.policy
@@ -12,6 +21,11 @@ import os
 import subprocess
 import time
 import pickle
+import warnings
+
+RANDOM_STATE = 1084
+CACHE_STORES = 0
+CACHE_LOADS = 0
 
 
 def task(task: str, *msg):
@@ -19,14 +33,14 @@ def task(task: str, *msg):
 
 
 def setup_dirs():
-    dirs_to_create = ['download', 'dataset/spam', 'dataset/notspam', 'cache']
+    dirs_to_create = ["download", "dataset/spam", "dataset/notspam", "cache"]
     for dir_path in dirs_to_create:
         if not os.path.isdir(dir_path):
             os.makedirs(dir_path)
 
 
 def get_cache_state(k: str) -> Optional[Any]:
-    """Returns state of K from cache/state.json, or None if missing. """
+    """Returns state of K from cache/state.json, or None if missing."""
     if not os.path.exists("cache/state.json"):
         return None
     with open("cache/state.json") as f:
@@ -46,27 +60,43 @@ def set_cache_state(k: str, v: Any):
 
 
 def save_cache(name: str, data: Any):
-    with open(f"cache/{name}.pickle", 'wb') as f:
+    global CACHE_STORES
+    with open(f"cache/{name}.pickle", "wb") as f:
+        CACHE_STORES += 1
         pickle.dump(data, f)
 
 
 def load_cache(name: str) -> Any:
+    global CACHE_LOADS
     if not os.path.exists(f"cache/{name}.pickle"):
         return None
     with open(f"cache/{name}.pickle", "rb") as f:
+        CACHE_LOADS += 1
         return pickle.load(f)
 
 
 def download_training_data():
     """Downloads training data using git clone, then copies the raw email format
-    into the dataset / directory. """
+    into the dataset / directory."""
 
     # Use git clone so it doesn't download it every time, but updates automatically.
     task("DOWNLOAD", "stdlib-js/datasets-spam-assassin")
-    subprocess.run(['git', 'clone', '--depth=1', 'https://github.com/stdlib-js/datasets-spam-assassin',
-                   'download/datasets-spam-assassin'], capture_output=True, text=True)
-    head_commit_proc = subprocess.run(['git', '-C', 'download/datasets-spam-assassin',
-                                       'rev-parse', 'HEAD'], capture_output=True, text=True)
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--depth=1",
+            "https://github.com/stdlib-js/datasets-spam-assassin",
+            "download/datasets-spam-assassin",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    head_commit_proc = subprocess.run(
+        ["git", "-C", "download/datasets-spam-assassin", "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
     head_commit = head_commit_proc.stdout.strip()
 
     # Caching solution: if we have processed data from the same commit, don't do it again.
@@ -74,13 +104,13 @@ def download_training_data():
         task("CACHE", "Collected dataset")
         return
 
-    p = 'download/datasets-spam-assassin/data'
+    p = "download/datasets-spam-assassin/data"
     use_dirs = {
         "easy-ham-1": False,
         "easy-ham-2": False,
         "hard-ham-1": False,
         "spam-1": True,
-        "spam-2": True
+        "spam-2": True,
     }
 
     task("TASK", "Collecting sources")
@@ -89,7 +119,7 @@ def download_training_data():
         for filename in os.listdir(f"{p}/{dir_name}"):
             # In this case, email sources are under the .text key in every JSON file.
 
-            if not filename.endswith('.json'):
+            if not filename.endswith(".json"):
                 continue
 
             with open(f"{p}/{dir_name}/{filename}") as f:
@@ -100,7 +130,7 @@ def download_training_data():
             # The hashed email serves as an ID.
 
             text = json_blob["text"]
-            hash = hashlib.sha1(bytes(text, 'utf8')).hexdigest()
+            hash = hashlib.sha1(bytes(text, "utf8")).hexdigest()
             dest = "dataset/spam" if is_spam else "dataset/notspam"
 
             with open(f"{dest}/{hash}", "w") as f:
@@ -110,25 +140,118 @@ def download_training_data():
 
 
 class SpamFilter:
-    """Processes all data from the given dataset, fits data to models and predicts. """
+    """Processes all data from the given dataset, fits data to models and predicts."""
 
     # format is { mail_hash: [is_spam, text] }
     emails: dict[str, list]
+    dataset_commit: str
 
     def __init__(self, dataset_path: str):
         self.emails = {}
+        self.load_emails(dataset_path)
+
+        results = []
+        training_rules = []
+
+        for vectorizer in [CountVectorizer, TfidfVectorizer]:
+            for classifier in [GaussianNB, KNeighborsClassifier, MLPClassifier]:
+                for max_features in [50, 100, 200, 500, 1000, 2000]:
+                    for ngrams in [(1, 1), (1, 2), (1, 3)]:
+                        training_rules.append(
+                            [vectorizer, classifier, max_features, ngrams]
+                        )
+
+        # Run training at the same time.
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            promises = {
+                executor.submit(self.train_with, *rule): rule for rule in training_rules
+            }
+
+            for promise in concurrent.futures.as_completed(promises):
+                vectorizer, classifier, max_features, ngrams = promises[promise]
+                avg, std = promise.result()
+
+                task(
+                    "TRAIN",
+                    f"{classifier.__name__:<20}",
+                    f"{vectorizer.__name__:<20}",
+                    f"max_features={max_features: 5}",
+                    f"avg=\033[1m{avg * 100:.2f}%\033[m",
+                    f"std={std * 100:.2f}%",
+                    f"ngrams={ngrams}",
+                )
+
+                results.append(
+                    [
+                        classifier.__name__,
+                        vectorizer.__name__,
+                        max_features,
+                        ngrams[1],
+                        f"{avg * 100:.3f}",
+                        f"{std * 100:.3f}",
+                    ]
+                )
+
+        with open("results.csv", "w") as f:
+            f.write("classifier;vectorizer;max_features;max_ngrams;avg;std\n")
+            for result in results:
+                r = [str(x) for x in result]
+                f.write(";".join(r) + "\n")
+
+    def train_with(
+        self, vectorizer, classifier, max_features, ngram_range
+    ) -> (float, float):
+        """Train the given classifier with the emails processed using CountVectorizer
+        with (max_features). Returns (average, standard_deviation) scores."""
+
+        cache_key = (
+            "score-"
+            + hashlib.sha1(
+                bytes(
+                    f":{vectorizer.__name__}"
+                    f":{classifier.__name__}:{max_features}:{ngram_range}"
+                    f":{RANDOM_STATE}:{self.dataset_commit}",
+                    "utf8",
+                )
+            ).hexdigest()
+        )
+
+        cached_scores = load_cache(cache_key)
+        if cached_scores:
+            return cached_scores
+
+        keys = list(self.emails.keys())
+        cv = vectorizer(max_features=max_features, ngram_range=ngram_range)
+        texts = [self.emails[k][1] for k in keys]
+        labels = [self.emails[k][0] for k in keys]
+
+        X = cv.fit_transform(texts).toarray()
+        y = np.array([1 if is_spam else 0 for is_spam in labels])
+        folder = RepeatedStratifiedKFold(
+            n_splits=2, n_repeats=5, random_state=RANDOM_STATE
+        )
+        scores = []
+        for train_index, test_index in folder.split(X, y):
+            y_pred = (
+                classifier().fit(X[train_index], y[train_index]).predict(X[test_index])
+            )
+            y_real = y[test_index]
+            scores.append(f1_score(y_real, y_pred))
+
+        avg, std = np.average(scores), np.std(scores)
+        save_cache(cache_key, (avg, std))
+        return avg, std
+
+    def load_emails(self, dataset_path):
         dataset_commit = get_cache_state("dataset-collected-from")
+        self.dataset_commit = dataset_commit
         cached_emails = load_cache(f"parsed-{dataset_commit}")
         if cached_emails:
             task("CACHE", "Parsed emails")
             self.emails = cached_emails
-        else:
-            self.load_emails(dataset_path)
-            save_cache(f"parsed-{dataset_commit}", self.emails)
+            task("TASK", f"\033[1mLoaded {len(self.emails)} emails\033[m")
+            return
 
-        task("TASK", f"\033[1mLoaded {len(self.emails)} emails\033[m")
-
-    def load_emails(self, dataset_path):
         task("TASK", "Processing all emails...")
         skipped = 0
 
@@ -143,43 +266,53 @@ class SpamFilter:
                 if text:
                     if processing_took > 0.015:
                         task(
-                            "WARN", f"\033[33m{p}\033[m took very long to process:", f"{int(processing_took * 1000)} ms")
-                    self.emails[mail_hash] = [
-                        True if subdir == "spam" else False,
-                        text
-                    ]
+                            "WARN",
+                            f"\033[33m{p}\033[m took very long to process:",
+                            f"{int(processing_took * 1000)} ms",
+                        )
+                    self.emails[mail_hash] = [True if subdir == "spam" else False, text]
 
                 if not text:
                     task("ERROR", f"\033[31m{p}\033[m failed")
                     skipped += 1
 
-        task("TASK",
-             f"\033[1mDataset has {len(self.emails)} records\033[m,",
-             f"skipped {skipped} due to processing errors")
+        task(
+            "TASK",
+            f"\033[1mDataset has {len(self.emails)} records\033[m,",
+            f"skipped {skipped} due to processing errors",
+        )
+        save_cache(f"parsed-{dataset_commit}", self.emails)
 
     def _get_content(self, mime_part):
         """Some emails have weird character sets like "DEFAULT", so we just turn
-        them into UTF-8 and hope for the best. """
+        them into UTF-8 and hope for the best."""
 
         charset = mime_part.get_content_charset("utf-8")
-        weird_charsets = ["default", "default_charset",
-                          "chinesebig5", "unknown-8bit", "gb2312_charset"]
+        weird_charsets = [
+            "default",
+            "default_charset",
+            "chinesebig5",
+            "unknown-8bit",
+            "gb2312_charset",
+        ]
+
         if charset.lower() in weird_charsets:
             mime_part.set_param("charset", "utf-8", header="Content-Type")
         return mime_part.get_content()
 
     def _text_from_mail(self, mail_path: str) -> Optional[str]:
-        """Parse raw email format from the path, returns visible text or None. """
+        """Parse raw email format from the path, returns visible text or None."""
 
         with open(mail_path) as f:
             m: email.message.EmailMessage = email.message_from_file(
-                f, policy=email.policy.default)
+                f, policy=email.policy.default
+            )
         return self._find_body(m)
 
     def _text_from_html(self, html_text: str) -> Optional[str]:
-        """Returns only the visible text from a HTML blob, or None on failure. """
+        """Returns only the visible text from a HTML blob, or None on failure."""
         try:
-            body = bs4.BeautifulSoup(html_text, 'html.parser').get_text()
+            body = bs4.BeautifulSoup(html_text, "html.parser").get_text()
             return body
         except Exception:
             task("ERROR", "Failed to parse HTML")
@@ -187,7 +320,7 @@ class SpamFilter:
 
     def _find_body(self, m: email.message.EmailMessage) -> Optional[str]:
         """Find text body for any given EmailMessage. Returns the raw text string
-        or None on failure. """
+        or None on failure."""
 
         # Different multipart types may have meaning in the real world, but we only
         # care about the text anyway. Note that we also append multipart/report to
@@ -195,29 +328,39 @@ class SpamFilter:
         # blob about "was not delivered". We are filtering against the email the user
         # gets, and not the underlying reported RFC822 payload. See
         # dataset/notspam/3b082669989941c5a0cc121af7ec212b806571b7 as an example.
-        accepted_multiparts = ['multipart/alternative', 'multipart/related',
-                               'multipart/mixed', 'multipart/signed', 'multipart/report']
-        content_type = m.get_content_type()
-        body = ''
+        accepted_multiparts = [
+            "multipart/alternative",
+            "multipart/related",
+            "multipart/mixed",
+            "multipart/signed",
+            "multipart/report",
+        ]
 
-        if content_type == 'text/plain':
+        content_type = m.get_content_type()
+        body = ""
+
+        if content_type == "text/plain":
             body = self._get_content(m)
-        elif content_type == 'text/html':
+        elif content_type == "text/html":
             body = self._text_from_html(self._get_content(m))
         elif content_type in accepted_multiparts:
             for part in m.walk():
                 part_content_type = part.get_content_type()
-                if part_content_type == 'text/plain':
+                if part_content_type == "text/plain":
                     body = self._get_content(part)
                     break
-                if part_content_type == 'text/html':
+                if part_content_type == "text/html":
                     body = self._text_from_html(self._get_content(part))
                     break
             if not body:
                 task("ERROR", "Cannot find working text format in email")
                 return None
         else:
-            task("ERROR", "Unsupported Content-Type while processing emails:", content_type)
+            task(
+                "ERROR",
+                "Unsupported Content-Type while processing emails:",
+                content_type,
+            )
             return None
         return body
 
@@ -225,11 +368,15 @@ class SpamFilter:
 def main():
     setup_dirs()
     download_training_data()
-    SpamFilter('dataset')
+    SpamFilter("dataset")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
+        # Silence ConvergenceWarnings from MLPClassifier
+        warnings.filterwarnings("ignore", category=ConvergenceWarning)
         main()
     except KeyboardInterrupt:
-        print("\nInterrupted by user, exiting.")
+        print("\n")
+        task("EXIT", "Interrupted by user, exiting.")
+    task("CACHE", f"\033[2mLoads {CACHE_LOADS}, stores {CACHE_STORES}\033[m")
