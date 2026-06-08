@@ -1,0 +1,65 @@
+#!/usr/bin/python3
+# Display collected results using matplotlib
+# Copyright (c) 2026 Politechnika Wrocławska
+
+import matplotlib.pyplot as plt
+
+
+def load_csv(p) -> list:
+    with open(p) as f:
+        all_lines = f.readlines()
+    keys = all_lines[0].strip().split(";")
+    data = []
+    for line in all_lines[1:]:
+        values = line.strip().split(";")
+        data.append({keys[i]: v for i, v in enumerate(values)})
+    return data
+
+
+experiment_1_data = load_csv("./experiment_1.csv")
+fig, axes = plt.subplots(3, 2)
+
+for max_ngrams in range(1, 4):
+    for vec_index, vec_name in enumerate(["CountVectorizer", "TfidfVectorizer"]):
+        ax = axes[max_ngrams - 1, vec_index]
+        ax.set_title(f"{vec_name} for {max_ngrams}-Grams")
+        ax.set_xlabel("Max Features")
+        ax.set_ylabel("Score [%]")
+        ax.grid()
+
+        print("render", max_ngrams, vec_name)
+
+        data = list(
+            filter(
+                lambda p: (
+                    p["vectorizer"] == vec_name and p["max_ngrams"] == str(max_ngrams)
+                ),
+                experiment_1_data,
+            )
+        )
+
+        gnb = list(filter(lambda p: p["classifier"] == "GaussianNB", data))
+        knn = list(filter(lambda p: p["classifier"] == "KNeighborsClassifier", data))
+        gnb = list(sorted(gnb, key=lambda p: int(p["max_features"])))
+        knn = list(sorted(knn, key=lambda p: int(p["max_features"])))
+        gnb_max = float(max(gnb, key=lambda p: float(p["avg"]))["avg"])
+        knn_max = float(max(knn, key=lambda p: float(p["avg"]))["avg"])
+
+        ax.plot(
+            [int(x["max_features"]) for x in gnb],
+            [float(x["avg"]) for x in gnb],
+            color="purple",
+            label=f"GaussianNB - {gnb_max:.2f}%",
+        )
+
+        ax.plot(
+            [int(x["max_features"]) for x in knn],
+            [float(x["avg"]) for x in knn],
+            color="green",
+            label=f"KNearestNeighbors - {knn_max:.2f}%",
+        )
+
+        ax.legend(loc="center right")
+
+fig.tight_layout()
+plt.show()

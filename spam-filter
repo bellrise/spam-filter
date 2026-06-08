@@ -7,7 +7,6 @@ from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.naive_bayes import GaussianNB
 from sklearn.metrics import f1_score
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.neural_network import MLPClassifier
 from sklearn.exceptions import ConvergenceWarning
 from typing import Optional, Any
 import concurrent.futures
@@ -145,16 +144,30 @@ class SpamFilter:
     # format is { mail_hash: [is_spam, text] }
     emails: dict[str, list]
     dataset_commit: str
+    best_params: list
+    best_params_score: float
 
     def __init__(self, dataset_path: str):
         self.emails = {}
         self.load_emails(dataset_path)
 
+        task("EXPERIMENT", "Find best parameter combination")
+        self.experiment_1()
+
+        task("EXPERIMENT", "Find best preprocessing method")
+        self.experiment_2()
+
+    def experiment_1(self):
+        """Find the best combination of vectorizer, classifier, max_features
+        and ngram_range parameters, for the given data."""
+
         results = []
         training_rules = []
+        best_params = []
+        best_params_score = 0
 
         for vectorizer in [CountVectorizer, TfidfVectorizer]:
-            for classifier in [GaussianNB, KNeighborsClassifier, MLPClassifier]:
+            for classifier in [GaussianNB, KNeighborsClassifier]:
                 for max_features in [50, 100, 200, 500, 1000, 2000]:
                     for ngrams in [(1, 1), (1, 2), (1, 3)]:
                         training_rules.append(
@@ -192,25 +205,125 @@ class SpamFilter:
                     ]
                 )
 
-        with open("results.csv", "w") as f:
+                if avg > best_params_score:
+                    best_params_score = avg
+                    best_params = [vectorizer, classifier, max_features, ngrams]
+
+        with open("experiment_1.csv", "w") as f:
             f.write("classifier;vectorizer;max_features;max_ngrams;avg;std\n")
             for result in results:
                 r = [str(x) for x in result]
                 f.write(";".join(r) + "\n")
 
+        self.best_params = best_params
+        self.best_params_score = best_params_score
+        task(
+            "INFO",
+            "Best parameters are:\033[1;34m",
+            best_params[0].__name__,
+            best_params[1].__name__,
+            f"max_features={best_params[2]}",
+            f"ngrams={best_params[3]}",
+            f": {best_params_score * 100:.2f}%\033[m",
+        )
+
+    def experiment_2(self):
+        """Find the best processing style for the best possible parameters
+        from experiment 1."""
+
+        vectorizer, classifier, max_features, ngrams = self.best_params
+        self.best_params_score = 0
+        results = []
+
+        def _train_with_params(remove_stop_words, is_lowercase):
+            avg, std = self.train_with(
+                vectorizer,
+                classifier,
+                max_features,
+                ngrams,
+                remove_stop_words=remove_stop_words,
+                custom_cache_key=("lowercase" if is_lowercase else None),
+            )
+
+            task(
+                "TRAIN",
+                f"{classifier.__name__:<20}",
+                f"{vectorizer.__name__:<20}",
+                f"max_features={max_features: 5}",
+                f"avg=\033[1m{avg * 100:.2f}%\033[m",
+                f"std={std * 100:.2f}%",
+                f"ngrams={ngrams}",
+                f"remove_stop_words={remove_stop_words}",
+                f"lowercase={is_lowercase}",
+            )
+
+            results.append(
+                [
+                    classifier.__name__,
+                    vectorizer.__name__,
+                    max_features,
+                    ngrams[1],
+                    f"{avg * 100:.2f}",
+                    f"{std * 100:.2f}",
+                    remove_stop_words,
+                    is_lowercase,
+                ]
+            )
+
+            if avg > self.best_params_score:
+                self.best_params_score = avg
+                self.best_params = [remove_stop_words, is_lowercase]
+
+        _train_with_params(remove_stop_words=False, is_lowercase=False)
+        _train_with_params(remove_stop_words=True, is_lowercase=False)
+
+        original_emails = self.emails.copy()
+        for k, (is_spam, content) in self.emails.items():
+            self.emails[k][1] = content.lower()
+
+        _train_with_params(remove_stop_words=False, is_lowercase=True)
+        _train_with_params(remove_stop_words=True, is_lowercase=True)
+
+        self.emails = original_emails
+        with open("experiment_2.csv", "w") as f:
+            f.write(
+                "classifier;vectorizer;max_features;max_ngrams;avg;std;remove_stop_words;lowercase\n"
+            )
+            for result in results:
+                r = [str(x) for x in result]
+                f.write(";".join(r) + "\n")
+
+        task(
+            "INFO",
+            f"Best parameters are: \033[1;34mremove_stop_words={self.best_params[0]} "
+            f"lowercase={self.best_params[1]}\033[m",
+        )
+
     def train_with(
-        self, vectorizer, classifier, max_features, ngram_range
+        self,
+        vectorizer,
+        classifier,
+        max_features,
+        ngram_range,
+        custom_cache_key=None,
+        remove_stop_words=False,
     ) -> (float, float):
         """Train the given classifier with the emails processed using CountVectorizer
         with (max_features). Returns (average, standard_deviation) scores."""
 
+        custom_cache_key = "" if custom_cache_key is None else (":" + custom_cache_key)
+        stop_words_key = "" if remove_stop_words is False else (":stop-words-removed")
         cache_key = (
             "score-"
             + hashlib.sha1(
                 bytes(
                     f":{vectorizer.__name__}"
-                    f":{classifier.__name__}:{max_features}:{ngram_range}"
-                    f":{RANDOM_STATE}:{self.dataset_commit}",
+                    f":{classifier.__name__}"
+                    f":{max_features}"
+                    f":{ngram_range}"
+                    f":{RANDOM_STATE}:{self.dataset_commit}"
+                    + custom_cache_key
+                    + stop_words_key,
                     "utf8",
                 )
             ).hexdigest()
@@ -221,7 +334,10 @@ class SpamFilter:
             return cached_scores
 
         keys = list(self.emails.keys())
-        cv = vectorizer(max_features=max_features, ngram_range=ngram_range)
+        stop_words = "english" if remove_stop_words else None
+        cv = vectorizer(
+            max_features=max_features, ngram_range=ngram_range, stop_words=stop_words
+        )
         texts = [self.emails[k][1] for k in keys]
         labels = [self.emails[k][0] for k in keys]
 
@@ -281,6 +397,7 @@ class SpamFilter:
             f"\033[1mDataset has {len(self.emails)} records\033[m,",
             f"skipped {skipped} due to processing errors",
         )
+
         save_cache(f"parsed-{dataset_commit}", self.emails)
 
     def _get_content(self, mime_part):

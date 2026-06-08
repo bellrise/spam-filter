@@ -1,0 +1,5 @@
+classifier;vectorizer;max_features;max_ngrams;avg;std;remove_stop_words;lowercase
+GaussianNB;TfidfVectorizer;2000;2;94.67;0.38;False;False
+GaussianNB;TfidfVectorizer;2000;2;93.95;0.47;True;False
+GaussianNB;TfidfVectorizer;2000;2;94.67;0.38;False;True
+GaussianNB;TfidfVectorizer;2000;2;93.95;0.47;True;True
