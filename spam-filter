@@ -8,6 +8,7 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.metrics import f1_score
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.exceptions import ConvergenceWarning
+from scipy.stats import wilcoxon  # <-- DODANE DO TESTU WILCOXONA
 from typing import Optional, Any
 import concurrent.futures
 import numpy as np
@@ -39,22 +40,20 @@ def setup_dirs():
 
 
 def get_cache_state(k: str) -> Optional[Any]:
-    """Returns state of K from cache/state.json, or None if missing."""
     if not os.path.exists("cache/state.json"):
         return None
-    with open("cache/state.json") as f:
+    with open("cache/state.json", encoding="utf-8") as f:
         state = json.load(f)
     return state.get(k, None)
 
 
 def set_cache_state(k: str, v: Any):
-    """Sets cache state of K to V."""
     state = {}
     if os.path.exists("cache/state.json"):
-        with open("cache/state.json") as f:
+        with open("cache/state.json", encoding="utf-8") as f:
             state = json.load(f)
     state[k] = v
-    with open("cache/state.json", "w") as f:
+    with open("cache/state.json", "w", encoding="utf-8") as f:
         json.dump(state, f, indent=4)
 
 
@@ -75,10 +74,6 @@ def load_cache(name: str) -> Any:
 
 
 def download_training_data():
-    """Downloads training data using git clone, then copies the raw email format
-    into the dataset / directory."""
-
-    # Use git clone so it doesn't download it every time, but updates automatically.
     task("DOWNLOAD", "stdlib-js/datasets-spam-assassin")
     subprocess.run(
         [
@@ -98,7 +93,6 @@ def download_training_data():
     )
     head_commit = head_commit_proc.stdout.strip()
 
-    # Caching solution: if we have processed data from the same commit, don't do it again.
     if get_cache_state("dataset-collected-from") == head_commit:
         task("CACHE", "Collected dataset")
         return
@@ -116,32 +110,25 @@ def download_training_data():
 
     for dir_name, is_spam in use_dirs.items():
         for filename in os.listdir(f"{p}/{dir_name}"):
-            # In this case, email sources are under the .text key in every JSON file.
-
             if not filename.endswith(".json"):
                 continue
 
-            with open(f"{p}/{dir_name}/{filename}") as f:
+            with open(f"{p}/{dir_name}/{filename}",encoding="utf-8") as f:
                 json_blob = json.load(f)
             if "text" not in json_blob:
                 continue
-
-            # The hashed email serves as an ID.
 
             text = json_blob["text"]
             hash = hashlib.sha1(bytes(text, "utf8")).hexdigest()
             dest = "dataset/spam" if is_spam else "dataset/notspam"
 
-            with open(f"{dest}/{hash}", "w") as f:
+            with open(f"{dest}/{hash}", "w",encoding="utf-8") as f:
                 f.write(text)
 
     set_cache_state("dataset-collected-from", head_commit)
 
 
 class SpamFilter:
-    """Processes all data from the given dataset, fits data to models and predicts."""
-
-    # format is { mail_hash: [is_spam, text] }
     emails: dict[str, list]
     dataset_commit: str
     best_params: list
@@ -158,13 +145,16 @@ class SpamFilter:
         self.experiment_2()
 
     def experiment_1(self):
-        """Find the best combination of vectorizer, classifier, max_features
-        and ngram_range parameters, for the given data."""
-
         results = []
         training_rules = []
         best_params = []
         best_params_score = 0
+
+        # Słowniki do przechowania najlepszych surowych wyników dla Wilcoxona
+        best_scores_nb = None
+        best_scores_knn = None
+        best_nb_score = -1
+        best_knn_score = -1
 
         for vectorizer in [CountVectorizer, TfidfVectorizer]:
             for classifier in [GaussianNB, KNeighborsClassifier]:
@@ -174,7 +164,6 @@ class SpamFilter:
                             [vectorizer, classifier, max_features, ngrams]
                         )
 
-        # Run training at the same time.
         with concurrent.futures.ThreadPoolExecutor() as executor:
             promises = {
                 executor.submit(self.train_with, *rule): rule for rule in training_rules
@@ -182,7 +171,7 @@ class SpamFilter:
 
             for promise in concurrent.futures.as_completed(promises):
                 vectorizer, classifier, max_features, ngrams = promises[promise]
-                avg, std = promise.result()
+                avg, std, raw_scores = promise.result()  # <-- Odbieramy też surowe wyniki (raw_scores)
 
                 task(
                     "TRAIN",
@@ -205,11 +194,21 @@ class SpamFilter:
                     ]
                 )
 
+                # Śledzimy najlepszą konfigurację dla Naive Bayes
+                if classifier == GaussianNB and avg > best_nb_score:
+                    best_nb_score = avg
+                    best_scores_nb = raw_scores
+
+                # Śledzimy najlepszą konfigurację dla KNN
+                if classifier == KNeighborsClassifier and avg > best_knn_score:
+                    best_knn_score = avg
+                    best_scores_knn = raw_scores
+
                 if avg > best_params_score:
                     best_params_score = avg
                     best_params = [vectorizer, classifier, max_features, ngrams]
 
-        with open("results/experiment_1.csv", "w") as f:
+        with open("results/experiment_1.csv", "w", encoding="utf-8") as f:
             f.write("classifier;vectorizer;max_features;max_ngrams;avg;std\n")
             for result in results:
                 r = [str(x) for x in result]
@@ -227,16 +226,24 @@ class SpamFilter:
             f": {best_params_score * 100:.2f}%\033[m",
         )
 
-    def experiment_2(self):
-        """Find the best processing style for the best possible parameters
-        from experiment 1."""
+        # --- WYKONANIE TESTU WILCOXONA ---
+        if best_scores_nb is not None and best_scores_knn is not None:
+            task("STAT-TEST", "Running Wilcoxon signed-rank test between best NB and best KNN...")
+            stat, p_value = wilcoxon(best_scores_nb, best_scores_knn)
+            
+            task("STAT-RESULT", f"Wilcoxon statistic: {stat:.4f}, p-value: {p_value:.6f}")
+            if p_value < 0.05:
+                task("STAT-RESULT", "\033[1;32mRóżnica między modelami jest STATYSTYCZNIE ISTOTNA (p < 0.05)!\033[m")
+            else:
+                task("STAT-RESULT", "\033[1;31mBrak podstaw do odrzucenia hipotezy zerowej – różnica NIE jest statystycznie istotna (p >= 0.05).\033[m")
 
+    def experiment_2(self):
         vectorizer, classifier, max_features, ngrams = self.best_params
         self.best_params_score = 0
         results = []
 
         def _train_with_params(remove_stop_words, is_lowercase):
-            avg, std = self.train_with(
+            avg, std, _ = self.train_with(
                 vectorizer,
                 classifier,
                 max_features,
@@ -285,7 +292,7 @@ class SpamFilter:
         _train_with_params(remove_stop_words=True, is_lowercase=True)
 
         self.emails = original_emails
-        with open("results/experiment_2.csv", "w") as f:
+        with open("results/experiment_2.csv", "w", encoding="utf-8") as f:
             f.write(
                 "classifier;vectorizer;max_features;max_ngrams;avg;std;remove_stop_words;lowercase\n"
             )
@@ -307,10 +314,7 @@ class SpamFilter:
         ngram_range,
         custom_cache_key=None,
         remove_stop_words=False,
-    ) -> (float, float):
-        """Train the given classifier with the emails processed using CountVectorizer
-        with (max_features). Returns (average, standard_deviation) scores."""
-
+    ) -> (float, float, list):  # <-- Zmieniony typ zwracany na (float, float, list)
         custom_cache_key = "" if custom_cache_key is None else (":" + custom_cache_key)
         stop_words_key = "" if remove_stop_words is False else (":stop-words-removed")
         cache_key = (
@@ -331,6 +335,10 @@ class SpamFilter:
 
         cached_scores = load_cache(cache_key)
         if cached_scores:
+            # Stary cache zwracał tylko (avg, std). Jeśli go załadujemy, wygenerujemy puste scores, 
+            # ale lepiej żeby cache był kompatychny:
+            if len(cached_scores) == 2:
+                return cached_scores[0], cached_scores[1], []
             return cached_scores
 
         keys = list(self.emails.keys())
@@ -355,8 +363,8 @@ class SpamFilter:
             scores.append(f1_score(y_real, y_pred))
 
         avg, std = np.average(scores), np.std(scores)
-        save_cache(cache_key, (avg, std))
-        return avg, std
+        save_cache(cache_key, (avg, std, scores))  # <-- Zapisujemy w cache pełną krotkę z listą scores
+        return avg, std, scores
 
     def load_emails(self, dataset_path):
         dataset_commit = get_cache_state("dataset-collected-from")
@@ -401,9 +409,6 @@ class SpamFilter:
         save_cache(f"parsed-{dataset_commit}", self.emails)
 
     def _get_content(self, mime_part):
-        """Some emails have weird character sets like "DEFAULT", so we just turn
-        them into UTF-8 and hope for the best."""
-
         charset = mime_part.get_content_charset("utf-8")
         weird_charsets = [
             "default",
@@ -418,16 +423,13 @@ class SpamFilter:
         return mime_part.get_content()
 
     def _text_from_mail(self, mail_path: str) -> Optional[str]:
-        """Parse raw email format from the path, returns visible text or None."""
-
-        with open(mail_path) as f:
+        with open(mail_path, encoding="utf-8") as f:
             m: email.message.EmailMessage = email.message_from_file(
                 f, policy=email.policy.default
             )
         return self._find_body(m)
 
     def _text_from_html(self, html_text: str) -> Optional[str]:
-        """Returns only the visible text from a HTML blob, or None on failure."""
         try:
             body = bs4.BeautifulSoup(html_text, "html.parser").get_text()
             return body
@@ -436,15 +438,6 @@ class SpamFilter:
             return None
 
     def _find_body(self, m: email.message.EmailMessage) -> Optional[str]:
-        """Find text body for any given EmailMessage. Returns the raw text string
-        or None on failure."""
-
-        # Different multipart types may have meaning in the real world, but we only
-        # care about the text anyway. Note that we also append multipart/report to
-        # this list, even if the mails are generated by a machine we find the text
-        # blob about "was not delivered". We are filtering against the email the user
-        # gets, and not the underlying reported RFC822 payload. See
-        # dataset/notspam/3b082669989941c5a0cc121af7ec212b806571b7 as an example.
         accepted_multiparts = [
             "multipart/alternative",
             "multipart/related",
@@ -490,7 +483,6 @@ def main():
 
 if __name__ == "__main__":
     try:
-        # Silence ConvergenceWarnings from MLPClassifier
         warnings.filterwarnings("ignore", category=ConvergenceWarning)
         main()
     except KeyboardInterrupt:
