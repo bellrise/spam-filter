@@ -8,7 +8,7 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.metrics import f1_score
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.exceptions import ConvergenceWarning
-from scipy.stats import wilcoxon  # <-- DODANE DO TESTU WILCOXONA
+from scipy.stats import wilcoxon  
 from typing import Optional, Any
 import concurrent.futures
 import numpy as np
@@ -150,7 +150,7 @@ class SpamFilter:
         best_params = []
         best_params_score = 0
 
-        # Słowniki do przechowania najlepszych surowych wyników dla Wilcoxona
+
         best_scores_nb = None
         best_scores_knn = None
         best_nb_score = -1
@@ -171,7 +171,7 @@ class SpamFilter:
 
             for promise in concurrent.futures.as_completed(promises):
                 vectorizer, classifier, max_features, ngrams = promises[promise]
-                avg, std, raw_scores = promise.result()  # <-- Odbieramy też surowe wyniki (raw_scores)
+                avg, std, raw_scores = promise.result()  
 
                 task(
                     "TRAIN",
@@ -194,12 +194,11 @@ class SpamFilter:
                     ]
                 )
 
-                # Śledzimy najlepszą konfigurację dla Naive Bayes
                 if classifier == GaussianNB and avg > best_nb_score:
                     best_nb_score = avg
                     best_scores_nb = raw_scores
 
-                # Śledzimy najlepszą konfigurację dla KNN
+
                 if classifier == KNeighborsClassifier and avg > best_knn_score:
                     best_knn_score = avg
                     best_scores_knn = raw_scores
@@ -226,7 +225,7 @@ class SpamFilter:
             f": {best_params_score * 100:.2f}%\033[m",
         )
 
-        # --- WYKONANIE TESTU WILCOXONA ---
+
         if best_scores_nb is not None and best_scores_knn is not None:
             task("STAT-TEST", "Running Wilcoxon signed-rank test between best NB and best KNN...")
             stat, p_value = wilcoxon(best_scores_nb, best_scores_knn)
@@ -314,7 +313,7 @@ class SpamFilter:
         ngram_range,
         custom_cache_key=None,
         remove_stop_words=False,
-    ) -> (float, float, list):  # <-- Zmieniony typ zwracany na (float, float, list)
+    ) -> (float, float, list):  
         custom_cache_key = "" if custom_cache_key is None else (":" + custom_cache_key)
         stop_words_key = "" if remove_stop_words is False else (":stop-words-removed")
         cache_key = (
@@ -335,8 +334,6 @@ class SpamFilter:
 
         cached_scores = load_cache(cache_key)
         if cached_scores:
-            # Stary cache zwracał tylko (avg, std). Jeśli go załadujemy, wygenerujemy puste scores, 
-            # ale lepiej żeby cache był kompatychny:
             if len(cached_scores) == 2:
                 return cached_scores[0], cached_scores[1], []
             return cached_scores
@@ -363,7 +360,7 @@ class SpamFilter:
             scores.append(f1_score(y_real, y_pred))
 
         avg, std = np.average(scores), np.std(scores)
-        save_cache(cache_key, (avg, std, scores))  # <-- Zapisujemy w cache pełną krotkę z listą scores
+        save_cache(cache_key, (avg, std, scores))
         return avg, std, scores
 
     def load_emails(self, dataset_path):
